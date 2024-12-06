@@ -1,12 +1,16 @@
-name: goreleaser
+name: release
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 on:
   push:
     tags:
-      - '*'
+      - "*"
 
 jobs:
-  goreleaser:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -22,5 +26,9 @@ jobs:
         with:
           version: latest
           args: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build OCI artifacts
+        run: ci/release-oci-artifacts.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
