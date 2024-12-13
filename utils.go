@@ -1,17 +1,28 @@
 package fpoc
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+
+	"golang.org/x/crypto/ssh"
 
 	igncfg "github.com/coreos/ignition/v2/config/v3_4"
 	igntyp "github.com/coreos/ignition/v2/config/v3_4/types"
 	"github.com/coreos/vcontext/report"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/mitchellh/mapstructure"
+
+	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
 // ExtCreateOpts extended version of servers.CreateOpts
@@ -188,4 +199,90 @@ func InsertSSHKeyIgn(spec *ExtCreateOpts, username, pubKey string) error {
 
 	spec.UserData = string(buf)
 	return nil
+}
+
+func CheckFileExists(filePath string) bool {
+	_, error := os.Stat(filePath)
+	return !errors.Is(error, os.ErrNotExist)
+}
+
+func GetInstanceSSHKey(settings provider.Settings, instanceId string, storagePath string) (privateKeyPem []byte, publicKeyPem []byte, err error) {
+	if settings.UseStaticCredentials && storagePath != "" {
+		return nil, nil, fmt.Errorf("storage_path must be empty when using static credentials")
+	}
+
+	if settings.UseStaticCredentials && len(settings.ConnectorConfig.Key) == 0 {
+		return nil, nil, fmt.Errorf("key must be provided when using static credentials")
+	}
+
+	var privateKey PrivPub
+	instanceSSHKeyFile := filepath.Join(storagePath, instanceId)
+	instanceSSHKeyFileExists := CheckFileExists(instanceSSHKeyFile)
+
+	if settings.UseStaticCredentials && len(settings.ConnectorConfig.Key) != 0 {
+		// Use static key provided by runner configuration
+		privateKey, err = ParseRawPrivateKey(settings.ConnectorConfig.Key)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse key: %w", err)
+		}
+	} else if storagePath != "" && instanceSSHKeyFileExists {
+		// Use pre-generated dynamic instance key
+		plainKey, err := os.ReadFile(instanceSSHKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read key file: %w", err)
+		}
+
+		privateKey, err = ParseRawPrivateKey(plainKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse key: %w", err)
+		}
+	} else {
+		// Generate dynamic instance key
+		privateKey, err = rsa.GenerateKey(rand.Reader, 4096)
+		if err != nil {
+			return nil, nil, fmt.Errorf("generating private key failed: %w", err)
+		}
+	}
+
+	privateKeyPem, publicKeyPem, err = GenerateSSHKeyPem(privateKey)
+
+	if storagePath != "" && !instanceSSHKeyFileExists {
+		err = os.WriteFile(instanceSSHKeyFile, privateKeyPem, 0600)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to write key file: %w", err)
+		}
+	}
+
+	return privateKeyPem, publicKeyPem, err
+}
+
+func ParseRawPrivateKey(key []byte) (privateKey PrivPub, err error) {
+	pkey, err := ssh.ParseRawPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("reading private key failed: %w", err)
+	}
+
+	var ok bool
+	privateKey, ok = pkey.(PrivPub)
+	if !ok {
+		return nil, fmt.Errorf("key doesn't export PublicKey()")
+	}
+
+	return privateKey, nil
+}
+func GenerateSSHKeyPem(key PrivPub) (privateKeyPem []byte, publicKeyPem []byte, err error) {
+	privateKeyPem = pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(key.(*rsa.PrivateKey)),
+		},
+	)
+
+	publicKey, err := ssh.NewPublicKey(key.Public())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return privateKeyPem, ssh.MarshalAuthorizedKey(publicKey), nil
+
 }

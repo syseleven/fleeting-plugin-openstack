@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +29,7 @@ type InstanceGroup struct {
 	NovaMicroversion string        `json:"nova_microversion"` // Microversion for the Nova client
 	ServerSpec       ExtCreateOpts `json:"server_spec"`       // instance creation spec
 	UseIgnition      bool          `json:"use_ignition"`      // Configure keys via Ignition (Fedora CoreOS / Flatcar)
+	SSHStoragePath   string        `json:"storage_path"`      // Path to storage dynamic ssh keys in
 	BootTimeS        string        `json:"boot_time"`         // optional: wait some time before report machine as available
 	BootTime         time.Duration
 
@@ -34,7 +37,6 @@ type InstanceGroup struct {
 	settings        provider.Settings
 	log             hclog.Logger
 	imgProps        *openstackclient.ImageProperties
-	sshPubKey       string
 	instanceCounter atomic.Int32
 }
 
@@ -76,9 +78,13 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	}
 
 	if g.UseIgnition {
-		err = g.initSSHKey(ctx, log, &settings)
-		if err != nil {
-			return provider.ProviderInfo{}, err
+		if g.imgProps != nil {
+			if g.imgProps.OSAdminUser == "" && settings.Username == "" {
+				return provider.ProviderInfo{}, fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing. Ensure one is set")
+			}
+			if g.imgProps.OSAdminUser != "" && settings.Username == "" {
+				settings.Username = g.imgProps.OSAdminUser
+			}
 		}
 	}
 
@@ -189,6 +195,13 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 			g.log.Info("Instance deletion request successful", "id", id)
 			succeeded = append(succeeded, id)
 		}
+
+		// Delete dynamic ssh key if persistence is enabled
+		if g.SSHStoragePath != "" {
+			err3 := os.Remove(filepath.Join(g.SSHStoragePath, id))
+			g.log.Error("failed to delete dynamic sshkey file: %w", err3)
+			err = errors.Join(err, err3)
+		}
 	}
 
 	g.log.Info("Decrease", "instances", instances)
@@ -217,14 +230,17 @@ func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, err
 
 func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	spec := new(ExtCreateOpts)
+
+	// Initialize the server spec with user provided configuration
 	err := copier.Copy(spec, &g.ServerSpec)
 	if err != nil {
 		return "", err
 	}
 
 	index := int(g.instanceCounter.Add(1))
+	instanceName := fmt.Sprintf(g.ServerSpec.Name, index)
 
-	spec.Name = fmt.Sprintf(g.ServerSpec.Name, index)
+	spec.Name = instanceName
 	if spec.Metadata == nil {
 		spec.Metadata = make(map[string]string)
 	}
@@ -236,7 +252,11 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	}
 
 	if g.UseIgnition {
-		err := InsertSSHKeyIgn(spec, g.settings.Username, g.sshPubKey)
+		_, publicKeyPem, err := GetInstanceSSHKey(g.settings, instanceName, g.SSHStoragePath)
+		if err != nil {
+			return "", err
+		}
+		err = InsertSSHKeyIgn(spec, g.settings.Username, string(publicKeyPem))
 		if err != nil {
 			return "", err
 		}
@@ -253,10 +273,9 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (provider.ConnectInfo, error) {
 	srv, err := g.client.GetServer(ctx, instanceID)
 	if err != nil {
-		return provider.ConnectInfo{}, fmt.Errorf("Failed to get server %s: %w", instanceID, err)
+		return provider.ConnectInfo{}, fmt.Errorf("failed to get server %s: %w", instanceID, err)
 	}
 
-	// g.log.Debug("Server info", "srv", srv)
 	if srv.Status != "ACTIVE" {
 		return provider.ConnectInfo{}, fmt.Errorf("instance status is not active: %s", srv.Status)
 	}
@@ -278,11 +297,14 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 	}
 
 	info := provider.ConnectInfo{
-		ConnectorConfig: g.settings.ConnectorConfig,
-		ID:              instanceID,
-		InternalAddr:    ipAddr,
-		ExternalAddr:    ipAddr,
+		ID:           instanceID,
+		InternalAddr: ipAddr,
+		ExternalAddr: ipAddr,
 	}
+
+	// We might inject ConnectorConfig.Key with a dynamic instance key, don't polute the global ConnectorConfig instance.
+	copier.Copy(info.ConnectorConfig, &g.settings.ConnectorConfig)
+
 	info.Protocol = provider.ProtocolSSH
 
 	if g.imgProps != nil {
@@ -317,8 +339,15 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		info.OS = "linux"
 		info.Arch = "amd64"
 	}
+	if info.UseStaticCredentials {
+		return info, nil
+	}
 
-	return info, nil
+	switch info.Protocol {
+	case provider.ProtocolSSH:
+		err = g.ssh(ctx, info)
+	}
+	return info, err
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
